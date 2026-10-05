@@ -30,6 +30,9 @@ public final class ContainmentConsoleModel {
         public let dropped: Int
     }
 
+    /// The timeline keeps the most recent launches only.
+    public static let maxLaunchRows = 50
+
     public let vendorIDs: [VendorID]
     public private(set) var launches: [LaunchRow] = []
     public private(set) var vendorRows: [VendorRow] = []
@@ -85,6 +88,7 @@ public final class ContainmentConsoleModel {
         do {
             let record = try await simulator.launch(configuration: config)
             launches.insert(Self.row(for: record), at: 0)
+            if launches.count > Self.maxLaunchRows { launches.removeLast(launches.count - Self.maxLaunchRows) }
             apply(record.snapshot)
             lastMessage = record.crashedBy.map { "Launch \(record.number) crashed in \($0)." }
                 ?? "Launch \(record.number) is up."
@@ -105,7 +109,9 @@ public final class ContainmentConsoleModel {
         do {
             let result = try await simulator.track(name)
             if result.isEmpty {
-                lastMessage = "No live launch: the last one crashed. Launch again."
+                lastMessage = launches.isEmpty
+                    ? "No launch yet. Tap Launch app."
+                    : "No live launch: the last one crashed. Launch again."
             } else {
                 let parts = result.sorted { $0.key < $1.key }.map { "\($0.key): \(Self.describe($0.value))" }
                 lastMessage = "\(name) → " + parts.joined(separator: ", ")
@@ -181,13 +187,23 @@ public final class ContainmentConsoleModel {
 
     static func row(for record: LaunchRecord) -> LaunchRow {
         let quarantined = record.snapshot.vendors.filter { $0.health.quarantine != nil }.map(\.id.rawValue)
+        let notStarted: [String] = record.snapshot.vendors.compactMap { status in
+            guard case .skipped(let reason) = status.lifecycle else { return nil }
+            switch reason {
+            case .payloadRejected: return "\(status.id) not started (payload rejected)"
+            case .startFailed: return "\(status.id) not started (start failed)"
+            case .disabledByPolicy, .outsideRollout, .quarantined: return nil
+            }
+        }
         let headline: String
         if let culprit = record.crashedBy {
             headline = "Crashed: \(culprit) took the app down"
-        } else if quarantined.isEmpty {
-            headline = "Up: all enabled vendors started"
-        } else {
+        } else if !quarantined.isEmpty {
             headline = "Up: \(quarantined.joined(separator: ", ")) contained"
+        } else if !notStarted.isEmpty {
+            headline = "Up: " + notStarted.joined(separator: ", ")
+        } else {
+            headline = "Up: all enabled vendors started"
         }
         return LaunchRow(
             id: record.number,
