@@ -5,7 +5,7 @@
 [![CI](https://github.com/rajatslakhina/vendor-sdk-containment-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/rajatslakhina/vendor-sdk-containment-kit/actions/workflows/ci.yml)
 ![Swift 6](https://img.shields.io/badge/Swift-6-orange) ![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue) ![License MIT](https://img.shields.io/badge/license-MIT-lightgrey)
 
-Demo app: (added after the companion repo is pushed — see below)
+**Demo app:** [vendor-sdk-containment-kit-demo](https://github.com/rajatslakhina/vendor-sdk-containment-kit-demo) is an iOS app that consumes this package as a remote dependency resolved from a released tag (up to next major from 1.0.1) and replays the incident launch by launch.
 
 ---
 
@@ -15,7 +15,9 @@ On 28 September 2026, a two-line flag cleanup on the vendor's side made the Goog
 
 1. **The SDK didn't validate a `nil` flag name.** The poison came in through config, not code. No release on your side and no review on your side.
 2. **The vendor's kill switch rolled out globally, all at once.** You can't rely on the vendor's control plane to undo the vendor's control plane.
-3. **Status dashboards stayed green.** They watched server health, and the failure was on the client. The only system positioned to notice was the app itself.
+3. **The failure was on the client.** Within a single launch, the only system positioned to notice and react was the app itself.
+
+In that incident, each device crashed once and the SDK then fell back, according to the postmortem. Next time you may not be so lucky, so this package is designed for the worse case: **a vendor that crashes the app on every cold start until something on the client stops it.**
 
 For an engineering lead, the question isn't how to fix one SDK. It's this: **which of our 15 vendor SDKs can take the whole app down, and what stops that from happening without a release?** That's a systems problem (detection across process deaths, attribution under ambiguity, a control plane you own, data durability) with an architecture problem inside it: app code must never touch a vendor SDK directly.
 
@@ -42,12 +44,12 @@ PolicyResolver LaunchSentinel PayloadValidator RolloutBucketer EventBuffer   ←
 | **Attribution + isolation** | Blaming the wrong vendor | Vendors start one at a time. A crash with exactly one marker on disk is unambiguous. A crash inside one vendor's `start()` while others were on probation is only *probable*: it gets a strike capped below the threshold, and every vendor involved starts *isolated* next launch (each runs its window alone). If several vendors were on probation and none was starting, nobody gets a strike, and all of them are isolated. Quarantine always requires at least one *unambiguous* strike: a crash with exactly one unproven vendor on disk. |
 | **Quarantine circuit breaker** | Crash loops | After `strikeThreshold` consecutive attributed crashes, the vendor is quarantined. After a cooldown it gets one isolated **probe**. A failed probe doubles the cooldown (capped, saturating); a successful one closes the circuit. A new app build earns a probe, not a pardon. |
 | **Your own kill switch** | Depending on the vendor's control plane | `PolicyDocument` comes from *your* server: enable/disable, % rollout, buffer-or-drop, and a `quarantineEpoch` that ops bumps to release a quarantine. |
-| **Event buffer** | Losing analytics while a vendor is out | Events for a not-yet-started, quarantined or paused vendor are queued per vendor and replayed in order, at-least-once, when it comes back. After a failed send, the queue backs off exponentially (1 s → 60 s) and resumes on its own. |
+| **Event buffer** | Losing analytics while a vendor is out | Events for a not-yet-started, quarantined or paused vendor are queued per vendor and replayed in order, at-least-once, when it comes back. After a failed send, the queue backs off exponentially (1 s → 60 s), with no timer: it resumes on the next `track` after the backoff, or immediately on `flush()`. |
 
 ## Design decisions and trade-offs
 
-**1. The marker write is synchronous, and that's load-bearing.** `ContainmentStore.save` is deliberately not `async`. If it were, the save could still be in flight when the vendor kills the process, and the crash would leave no trace. Every `await` into vendor code (`start` or `send`) is preceded by a save. Two tests pin this down. `testMarkerIsDurableBeforeVendorCodeRuns` reads the store from *inside* the vendor's `start()` and requires its marker to already be there. `testWithAStoreThatForgetsTheAppCrashLoopsForever` feeds in a store that forgets and asserts that the app *does* crash on all six launches, which shows containment rests on persistence and nothing in-process. If the marker can't be persisted at all, the vendor isn't started (fail closed: an unrecorded start is an undetectable crash). If a buffered event can't be persisted, `track` reports `.bufferedVolatile` instead of pretending.
-*Rejected:* relying on MetricKit crash diagnostics alone. They arrive late (often the next day), so they can't stop a loop that repeats on every cold start. They make a good second signal, not the primary one.
+**1. The marker write is synchronous, and that's load-bearing.** `ContainmentStore.save` is deliberately not `async`. If it were, the save could still be in flight when the vendor kills the process, and the crash would leave no trace. Every `await` into vendor code (`start` or `send`) that involves persisted state is preceded by a save. (The only exception is `.personal` live sends, which by design touch no persisted state.) Two tests pin this down. `testMarkerIsDurableBeforeVendorCodeRuns` reads the store from *inside* the vendor's `start()` and requires its marker to already be there. `testWithAStoreThatForgetsTheAppCrashLoopsForever` is the negative control for the headline scenario: the identical run with a store that forgets *does* crash on all six launches. Paired with the positive test, it shows the containment comes from persisted evidence and nothing in-process. If the marker can't be persisted at all, the vendor isn't started (fail closed: an unrecorded start is an undetectable crash). If a buffered event can't be persisted, `track` reports `.bufferedVolatile` instead of pretending.
+*Rejected:* relying on MetricKit crash diagnostics alone. They arrive late (often the next day), so they can't stop a crash that repeats on every cold start. They make a good second signal, not the primary one.
 
 **2. Ambiguity is resolved by isolation, not by guessing.** There are two naive designs. Blaming every vendor that was running quarantines innocent SDKs, which is a self-inflicted outage. "Blame whoever was inside `start()`" is wrong whenever another vendor's background thread is the one that died. Here, only unambiguous evidence (a crash with exactly one unproven vendor) can push a vendor over the threshold, and isolation is how that evidence gets collected. A crash with no clear culprit costs one extra launch to isolate. `testAmbiguousCrashConvergesOnTheTrueCulpritOnly` checks every attribution against the harness's ground truth over six launches. `testContentionCrashNeverQuarantinesTheVendorThatHappenedToBeStarting` injects a crash in vendor A that fires *while vendor B is inside `start()`*, and requires B never to be quarantined.
 *Costs:* isolated vendors start up to `stabilityWindow` apart, which only affects vendors under suspicion. And a crash that needs *two* vendors running together (contention) is suppressed by isolation instead of being pinned on one of them, so it shows up as crashes on alternating launches. That's a signal to investigate, not something the client can resolve on its own.
@@ -55,11 +57,11 @@ PolicyResolver LaunchSentinel PayloadValidator RolloutBucketer EventBuffer   ←
 **3. A stale policy may only restrict.** The last-known-good document survives a dead control plane (so yesterday's kill still holds today). But once it's older than `policyMaxStaleness`, or dated in the future because the clock moved, each rule is *met* with the compiled-in default: `enabled && enabled`, `min(rollout)`, and drop wins over buffer. Vendors named in neither document are off. `testStalenessPropertyCheckerCatchesABrokenCombiner` runs the property checker against both `meet` and a deliberately broken "remote wins" combiner, and requires the broken one to fail.
 *Rejected:* "stale means compiled default". That would silently re-enable a vendor you killed remotely as soon as the user goes offline for a week.
 
-**4. The policy document is versioned and immutable.** Rollbacks (`version < cached`) are rejected, and so is **reusing a version with a different body**, because that's a config change that skipped review. That was the class of change behind the original incident.
+**4. The policy document is versioned and immutable.** Rollbacks (`version < cached`) are rejected, and so is **reusing a version with a different body**, because that's a config change that skipped review. Config changes were the class of change behind the original incident.
 
 **5. Buffer-or-drop is a per-rule decision.** An operational pause buffers. A privacy or legal kill (`whenDisabled: .drop`) drops new events *and purges what was queued*. Events marked `.personal` are never written to disk at all: if they can't be sent live, they're dropped and counted. Capacity is **per vendor**, and overflow evicts that vendor's own oldest event, so one noisy quarantined SDK can't push out another vendor's data.
 
-**6. Replay order survives actor reentrancy.** While any send to a vendor is suspended (live or replay), the vendor is marked in flight. A new `track` call appends behind the queue, so it can't overtake. A failed live send goes back to the *head* of the queue. A replayed event stays on disk until its send succeeds, so a crash mid-send replays it next launch instead of losing it. The ordering tests use a vendor callback that re-enters the runtime mid-send: `testReentrantTrackDuringReplayCannotOvertakeQueuedEvents`, `testFailedReplayKeepsOrderAcrossARetry` and `testFailedLiveSendIsRetriedBeforeNewerEvents`. `testCrashMidReplayKeepsTheHeadOnDisk` covers the crash case.
+**6. Delivery order survives actor reentrancy, and delivery is at-least-once.** Every bufferable event, even one for a vendor that's already up, goes append → save → send → remove. So it's on disk before vendor code sees it, and a crash mid-send replays it next launch. While a send is suspended, the vendor is marked in flight, so a reentrant `track` appends behind the queue and can't overtake. A failed send stays at the head of the queue. `.personal` events are the deliberate exception: they're never on disk, they're sent live only when nothing is queued, and otherwise they're dropped (at-most-once). The ordering tests use a vendor callback that re-enters the runtime mid-send: `testReentrantTrackDuringReplayCannotOvertakeQueuedEvents`, `testFailedReplayKeepsOrderAcrossARetry` and `testFailedLiveSendIsRetriedBeforeNewerEvents`. The crash cases are covered by `testCrashMidReplayKeepsTheHeadOnDisk` and `testCrashDuringAFirstLiveSendKeepsTheEventOnDisk`.
 
 **7. Functional core, imperative shell.** All the decision logic (`LaunchSentinel.recover`, `PolicyResolver.resolve`, `PayloadValidator`, `RolloutBucketer`, `EventBuffer`) is pure value types with no I/O, so it's exhaustively testable without mocks. The single actor `ContainmentRuntime` owns ordering and persistence and nothing else.
 
@@ -70,6 +72,7 @@ PolicyResolver LaunchSentinel PayloadValidator RolloutBucketer EventBuffer   ←
 - A marker on disk means "the process died while this vendor was unproven". That also happens when the user force-quits inside the stability window, when the system kills the app (jetsam) after it's backgrounded inside the window, and when **the app's own code** crashes while a vendor is on probation. All of these can look like a vendor crash. The default threshold of 2, plus the rule that an ambiguous crash can never be the strike that quarantines, tolerates one false positive at the cost of a second crash.
 - Each post-cooldown or post-upgrade probe of a still-broken vendor costs one more crash, by design (that's how you learn it's still broken). Cooldowns double up to `maxCooldown`.
 - `FileContainmentStore` uses an atomic temp-file-and-rename write. That survives a process crash, but there's no `fsync`, so it doesn't promise durability across power loss.
+- Markers only cover `start()` and the stability window. A vendor that crashes *later*, for example in `send()` for one specific event, or in a callback minutes after launch, is not detected or attributed by the sentinel, and can keep crashing the app. Your app-owned kill switch is the remedy for that case. Extending markers to every vendor call is possible, but it costs a synchronous write per call.
 - Health entries for vendors you've since removed aren't garbage-collected (they're tiny).
 
 ## Usage
@@ -104,10 +107,18 @@ try await runtime.track("app_open")    // buffered until the vendor is up, then 
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/rajatslakhina/vendor-sdk-containment-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/vendor-sdk-containment-kit.git", from: "1.0.1")
 ```
 
 `LaunchSimulator` (in the core module) is the fault-injection harness: repeated cold launches against one persistent store, with vendors that can crash on a null flag or during their stability window. The test suite and the demo app both run on it.
+
+## Running the tests
+
+```bash
+swift test                                      # macOS
+swift build --build-tests -Xswiftc -warnings-as-errors && \
+  swift test -Xlinker --allow-shlib-undefined   # Linux (see the CI file for why the flag)
+```
 
 ## Layout
 
@@ -115,14 +126,14 @@ try await runtime.track("app_open")    // buffered until the vendor is up, then 
 Sources/VendorContainment/      Primitives, Saturating, Rollout, Payload, Policy,
                                 Sentinel, EventBuffer, Store, Runtime, Harness
 Sources/VendorContainmentUI/    ContainmentConsoleModel (@Observable, Linux-tested) + SwiftUI view
-Tests/                          83 XCTest cases across both modules
+Tests/                          89 XCTest cases across both modules
 ```
 
 ## Verification
 
-- **Local (Linux, Swift 6.1.2):** clean build (`rm -rf .build`) with `swift build --build-tests -Xswiftc -warnings-as-errors` gives 0 warnings. The XCTest bundle passes **83 / 83**.
+- **Local (Linux, Swift 6.1.2):** clean build (`rm -rf .build`) with `swift build --build-tests -Xswiftc -warnings-as-errors` gives 0 warnings. The XCTest bundle passes **89 / 89**.
 - **CI:** see the [Actions tab](https://github.com/rajatslakhina/vendor-sdk-containment-kit/actions). The Linux job runs `swift build -Xswiftc -warnings-as-errors` + `swift test -Xlinker --allow-shlib-undefined` in `swift:6.1-noble` (the linker flag works around a missing Observation symbol in the Linux toolchain). The macOS job runs `swift test -Xswiftc -warnings-as-errors` and compiles the SwiftUI view for `generic/platform=iOS Simulator`.
-- **Simulator:** see the companion demo repo for exactly what was and wasn't run.
+- **Simulator:** the demo app has **not** been run on a Simulator. The unattended session that built it couldn't drive Xcode, and no screenshots exist. The demo repo's CI is configured to compile it for `generic/platform=iOS Simulator` against this package from GitHub. That would be a build, not a run. The console model behind it is unit-tested (`VendorContainmentUITests`).
 
 ## License
 
