@@ -31,6 +31,15 @@ final class IncidentReplayTests: XCTestCase {
         let l3 = try await sim.launch()
         let l4 = try await sim.launch()
         XCTAssertEqual([l1, l2, l3, l4].map(\.crashedBy), [b, b, nil, nil])
+        // Launch 1 died in b.start() while a was on probation: only a
+        // provisional strike, and both vendors isolated. (A naive "blame
+        // whoever was starting" design passes the sequence check above but
+        // fails here.)
+        XCTAssertEqual(l2.snapshot.findings.first, .crashProbablyAttributed(b, strikes: 1, alsoRunning: [a]))
+        // In launch 2, a ran its whole window alone and was cleared before b
+        // started; b then died alone.
+        XCTAssertEqual(status(a, l2)?.lifecycle, .running(stable: true))
+        XCTAssertTrue(l2.snapshot.findings.contains(.stable(a)))
         XCTAssertEqual(l3.snapshot.findings.first, .crashAttributed(b, strikes: 2))
         XCTAssertEqual(status(b, l3)?.lifecycle, .skipped(.quarantined))
         XCTAssertEqual(status(a, l3)?.lifecycle, .running(stable: true))
@@ -95,9 +104,10 @@ final class IncidentReplayTests: XCTestCase {
         }
     }
 
-    /// Feeds in a broken dependency, a store that forgets, and asserts the
-    /// headline property *fails*: containment depends on persistence, not
-    /// on anything in-process. (The save-*before*-start ordering is pinned
+    /// Negative control for the scenario above: the identical run with a
+    /// store that forgets must crash every time. Paired with the positive
+    /// test, it shows the containment comes from persisted evidence and not
+    /// from anything in-process. (The save-*before*-start ordering is pinned
     /// separately by `testMarkerIsDurableBeforeVendorCodeRuns`.)
     func testWithAStoreThatForgetsTheAppCrashLoopsForever() async throws {
         var config = Fixture.config()
@@ -171,4 +181,46 @@ final class IncidentReplayTests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(records.filter { $0.crashedBy != nil }.count, 4)
     }
+
+    /// A second `launch()` issued while the first is suspended mid-launch
+    /// (here: from inside it, after boot) must be refused.
+    func testOverlappingLaunchesAreRefused() async throws {
+        let sim = Fixture.simulator([(a, .afterFirstFrame)])
+        let outcome = OutcomeBox()
+        await sim.setBeforeStartupHook { [sim] in
+            // One-shot, so a broken (unguarded) simulator fails this test
+            // cleanly instead of recursing forever.
+            guard outcome.claim() else { return }
+            do {
+                _ = try await sim.launch()
+                outcome.set("completed")
+            } catch let error as LaunchSimulatorError {
+                outcome.set(error == .launchInProgress ? "refused" : "other")
+            } catch {
+                outcome.set("other")
+            }
+        }
+        let first = try await sim.launch()
+        XCTAssertNil(first.crashedBy)
+        XCTAssertEqual(outcome.get(), "refused")
+        let history = await sim.history.count
+        XCTAssertEqual(history, 1, "only the first launch ran")
+    }
+
+    func testHistoryIsBounded() async throws {
+        let sim = Fixture.simulator([(a, .afterFirstFrame)])
+        for _ in 0..<(LaunchSimulator.maxHistory + 5) { try await sim.launch() }
+        let count = await sim.history.count
+        XCTAssertEqual(count, LaunchSimulator.maxHistory)
+    }
+}
+
+final class OutcomeBox: @unchecked Sendable {
+    // @unchecked: guarded by `lock`.
+    private let lock = NSLock()
+    private var value: String?
+    private var claimed = false
+    func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if claimed { return false }; claimed = true; return true }
+    func set(_ v: String) { lock.lock(); value = v; lock.unlock() }
+    func get() -> String? { lock.lock(); defer { lock.unlock() }; return value }
 }

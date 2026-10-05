@@ -318,6 +318,23 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertThrowsError(try config.validate())
     }
 
+    /// Object members are walked in key order, so the first structural
+    /// violation reported doesn't depend on dictionary layout.
+    func testValidatorResultIsIndependentOfDictionaryLayout() {
+        var deep = PayloadValue.null
+        for _ in 0..<20 { deep = .array([deep]) }
+        let long = PayloadValue.string(String(repeating: "x", count: 5_000))
+        var small: VendorPayload = [:]
+        small["a"] = deep
+        small["b"] = long
+        var big = VendorPayload(minimumCapacity: 4_096)
+        big["b"] = long
+        big["a"] = deep
+        for payload in [small, big] {
+            XCTAssertEqual(PayloadValidator.validate(payload, against: .permissive), [.tooDeep(limit: 8)])
+        }
+    }
+
     func testStaleMeetKeepsTheNewestQuarantineEpoch() {
         let merged = VendorRule(quarantineEpoch: 3).meet(VendorRule(quarantineEpoch: 0))
         XCTAssertEqual(merged.quarantineEpoch, 3, "a remote release must survive staleness")
@@ -333,12 +350,17 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(PayloadValidator.validate(["o": .object(wide)], against: .permissive), [.tooManyNodes(limit: 2_000)])
     }
 
-    func testPrependOnAFullQueueDropsTheOldestWhichIsTheNewcomer() {
-        var buffer = EventBuffer(capacityPerVendor: 1)
-        buffer.append(ContainedEvent(name: "newer", privacy: .anonymous, at: t0), for: a)
-        XCTAssertEqual(buffer.prepend(ContainedEvent(name: "older", privacy: .anonymous, at: t0), for: a), .refusedNoCapacity)
-        XCTAssertEqual(buffer.pending(for: a).map(\.event.name), ["newer"])
-        XCTAssertEqual(buffer.evicted, 1)
+    /// Extreme thresholds on the provisional path must clamp, not trap
+    /// (`Int.min - 1` would overflow).
+    func testExtremeThresholdsNeverTrap() {
+        var s = SentinelState()
+        s.markers = [a: .probation(since: t0), b: .starting]
+        for threshold in [Int.min, -1, 0, Int.max] {
+            let config = SentinelConfiguration(strikeThreshold: threshold, baseCooldown: 1, maxCooldown: 1)
+            let (out, _) = LaunchSentinel.recover(s, configuration: config, now: t0, appVersion: "1", epochs: [:])
+            XCTAssertEqual(out.health[b]?.strikes, threshold == Int.max ? 1 : 0, "threshold \(threshold)")
+            XCTAssertNil(out.health[b]?.quarantine, "threshold \(threshold): a probable-only crash must never quarantine")
+        }
     }
 
     func testResizePreservesOrderAndCounters() {

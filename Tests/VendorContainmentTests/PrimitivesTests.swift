@@ -98,7 +98,7 @@ final class PayloadTests: XCTestCase {
         XCTAssertEqual(PayloadValidator.validate(payload, against: schema), [])
     }
 
-    func testDeepNestingIsBoundedNotRecursive() {
+    func testDeepNestingIsBoundedAndStopsEarly() {
         var value = PayloadValue.null
         for _ in 0..<5_000 { value = .array([value]) }
         let violations = PayloadValidator.validate(["flag_name": .string("x"), "deep": value], against: schema)

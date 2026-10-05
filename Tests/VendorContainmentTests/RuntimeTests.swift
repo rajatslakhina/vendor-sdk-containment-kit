@@ -16,6 +16,9 @@ final class RuntimeTests: XCTestCase {
         XCTAssertThrowsError(try Fixture.runtime([x], clock: clock, config: bad))
         bad = Fixture.config(threshold: 0)
         XCTAssertThrowsError(try Fixture.runtime([x], clock: clock, config: bad))
+        bad = Fixture.config()
+        bad.bufferCapacityPerVendor = 0
+        XCTAssertThrowsError(try Fixture.runtime([x], clock: clock, config: bad), "capacity 0 would starve running vendors")
     }
 
     func testCallsBeforeBootAndTwiceAreRefused() async throws {
@@ -330,9 +333,9 @@ final class RuntimeDurabilityTests: XCTestCase {
         XCTAssertEqual(a.received, ["e1", "e1", "e2"])
     }
 
-    /// After a transient failure the queue resumes on the next event once the
-    /// backoff has passed. No manual flush, nothing stranded.
-    func testQueueResumesAutomaticallyAfterBackoff() async throws {
+    /// After a transient failure there is no timer: the queue resumes on the
+    /// next `track` once the backoff has passed (or on `flush()`).
+    func testQueueResumesOnTheNextTrackAfterBackoff() async throws {
         let a = RecordingAdapter("a", clock: clock)
         let attempts = Counter()
         a.onSend = { _ in if attempts.next() == 0 { throw TestError() } }
@@ -345,7 +348,7 @@ final class RuntimeDurabilityTests: XCTestCase {
         XCTAssertEqual(a.received, ["e1"], "inside the backoff nothing is retried")
         clock.advance(by: 1)
         let after = try await runtime.track("e3")
-        XCTAssertEqual(after["a"], .buffered)
+        XCTAssertEqual(after["a"], .sent, "e3 went out behind the retried e1 and e2")
         XCTAssertEqual(a.received, ["e1", "e1", "e2", "e3"])
     }
 
@@ -354,6 +357,59 @@ final class RuntimeDurabilityTests: XCTestCase {
         try await runtime.boot(policy: nil)
         let d = try await runtime.track("email_entered", privacy: .personal)
         XCTAssertEqual(d["a"], .dropped(.personalNotBufferable))
+    }
+
+    /// A bufferable event to a running vendor is on disk before vendor code
+    /// runs: crash inside its very first (live) send and it is still queued.
+    func testCrashDuringAFirstLiveSendKeepsTheEventOnDisk() async throws {
+        let store = InMemoryContainmentStore()
+        let a = RecordingAdapter("a", clock: clock)
+        a.onSend = { _ in throw SimulatedCrash(vendor: "a") }
+        let runtime = try Fixture.runtime([a], clock: clock, store: store)
+        try await runtime.boot(policy: nil)
+        try await runtime.runStartup()
+        do { try await runtime.track("live"); XCTFail("expected crash") } catch is SimulatedCrash {}
+        XCTAssertEqual(store.load()?.buffer.pending(for: "a").map(\.event.name), ["live"])
+    }
+
+    /// `.personal` events go out live to a running vendor with an empty
+    /// queue, and are never written to the store.
+    func testPersonalEventIsSentLiveButNeverPersisted() async throws {
+        let store = InMemoryContainmentStore()
+        let a = RecordingAdapter("a", clock: clock)
+        let seenOnDisk = Counter()
+        a.onSend = { event in
+            // Checked *during* the send: append-save-send-remove would fail here.
+            if store.load()?.buffer.pending(for: "a").contains(where: { $0.event.name == event.name }) == true {
+                _ = seenOnDisk.next()
+            }
+        }
+        let runtime = try Fixture.runtime([a], clock: clock, store: store)
+        try await runtime.boot(policy: nil)
+        try await runtime.runStartup()
+        let d = try await runtime.track("email_entered", privacy: .personal)
+        XCTAssertEqual(d["a"], .sent)
+        XCTAssertEqual(a.received, ["email_entered"])
+        XCTAssertEqual(store.load()?.buffer.totalCount, 0)
+        XCTAssertEqual(seenOnDisk.next(), 0, "the personal event was never in the persisted queue")
+    }
+
+    /// An event queued by a reentrant `track` during a personal live send is
+    /// delivered when that send finishes, not stranded until the next event.
+    func testEventQueuedDuringAPersonalSendIsNotStranded() async throws {
+        let a = RecordingAdapter("a", clock: clock)
+        let box = RuntimeBox()
+        a.onSend = { event in
+            if event.name == "pii" { _ = try await box.runtime?.track("follow_up") }
+        }
+        let runtime = try Fixture.runtime([a], clock: clock)
+        box.runtime = runtime
+        try await runtime.boot(policy: nil)
+        try await runtime.runStartup()
+        try await runtime.track("pii", privacy: .personal)
+        XCTAssertEqual(a.received, ["pii", "follow_up"])
+        let snap = await runtime.snapshot()
+        XCTAssertEqual(snap.vendors.first?.buffered, 0)
     }
 
     func testAStoreFailureIsReportedAsVolatile() async throws {
