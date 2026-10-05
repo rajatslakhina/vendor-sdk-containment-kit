@@ -23,7 +23,9 @@ public struct ContainmentConfiguration: Sendable, Equatable {
     public var validatesVendorPayloads = true
     /// How old a cached policy may get before it can only restrict.
     public var policyMaxStaleness: TimeInterval = 7 * 86_400
-    /// Backoff after a failed send before the queue is retried automatically.
+    /// Backoff after a failed send. There is no timer: the queue is retried on
+    /// the next `track` after the backoff has elapsed, or immediately by
+    /// ``ContainmentRuntime/flush()``.
     public var baseRetryDelay: TimeInterval = 1
     public var maxRetryDelay: TimeInterval = 60
 
@@ -43,7 +45,7 @@ public struct ContainmentConfiguration: Sendable, Equatable {
         try check(sentinel.baseCooldown.isFinite && sentinel.baseCooldown > 0, "baseCooldown must be > 0")
         try check(sentinel.maxCooldown.isFinite && sentinel.maxCooldown >= sentinel.baseCooldown,
                   "maxCooldown must be >= baseCooldown")
-        try check(bufferCapacityPerVendor >= 0, "bufferCapacityPerVendor must be >= 0")
+        try check(bufferCapacityPerVendor >= 1, "bufferCapacityPerVendor must be >= 1 (every bufferable event goes through the queue)")
         try check(bufferMaxAge.isFinite && bufferMaxAge >= 0, "bufferMaxAge must be >= 0")
         try check(policyMaxStaleness.isFinite && policyMaxStaleness >= 0, "policyMaxStaleness must be >= 0")
         try check(baseRetryDelay.isFinite && baseRetryDelay > 0, "baseRetryDelay must be > 0")
@@ -137,10 +139,13 @@ public struct RuntimeSnapshot: Sendable, Equatable {
 ///
 /// Lifecycle per launch: `boot` (synchronous decisions, no vendor code runs)
 /// → first frame → `runStartup` (serial, marker-guarded starts) → `track`
-/// any time. Every `await` into vendor code (`start`, `send`) is preceded by
-/// a synchronous `save`, so whatever is on disk is the truth a crash would
-/// leave: the marker for a start, the queue (with the in-flight event still
-/// at its head) for a send.
+/// any time. Every `await` into vendor code (`start`, `send`) that involves
+/// persisted state is preceded by a synchronous `save`, so whatever is on disk is the truth a crash would
+/// leave: the marker for a start, and for a send the queue with the
+/// in-flight event still at its head. Bufferable events always go through
+/// the queue (append, save, send, remove), so delivery is at-least-once.
+/// `.personal` events are the deliberate exception: never written to disk,
+/// sent live only, so at-most-once.
 public actor ContainmentRuntime {
     private let adapters: [VendorID: any VendorAdapter]
     private let order: [VendorID]
@@ -207,8 +212,10 @@ public actor ContainmentRuntime {
     /// may start. Runs no vendor code, so it is safe before the first frame.
     ///
     /// - Parameters:
-    ///   - policy: the document just fetched from the app's own control plane,
-    ///     or `nil` if the fetch failed (last-known-good is used).
+    ///   - policy: a document from the app's own control plane that is already
+    ///     on hand (typically fetched in the background during the *previous*
+    ///     session; never block the first frame on a network call), or `nil`,
+    ///     in which case the cached last-known-good is used.
     ///   - payloads: each vendor's configuration payload.
     @discardableResult
     public func boot(policy: PolicyDocument?, payloads: [VendorID: VendorPayload] = [:]) throws -> RuntimeSnapshot {
@@ -402,35 +409,19 @@ public actor ContainmentRuntime {
 
     private func route(_ event: ContainedEvent, to id: VendorID) async throws -> Delivery {
         switch lifecycle[id] {
+        case .running? where event.privacy == .personal:
+            return try await sendPersonalLive(event, to: id)
         case .running?:
-            // Live only if nothing older is queued and nothing is in flight for
-            // this vendor; otherwise this event would overtake older ones.
-            guard state.buffer.count(for: id) == 0, !inFlight.contains(id), let adapter = adapters[id] else {
-                let delivery = buffer(event, for: id)
-                try await drainIfDue(id)
-                return delivery
-            }
-            inFlight.insert(id)
-            persist() // durable before control passes to vendor code
-            do {
-                try await adapter.send(event)
-                inFlight.remove(id)
-                try ensureAlive()
-                sent[id] = Saturating.increment(sent[id] ?? 0)
-                retry[id] = nil
-                try await drainIfDue(id)
-                return .sent
-            } catch let fault as FatalFault {
-                terminated = true
-                throw fault
-            } catch {
-                inFlight.remove(id)
-                try ensureAlive()
-                noteSendFailure(id)
-                // Anything that queued behind this send while it was in
-                // flight is newer, so the failed event goes back in front.
-                return requeueAtHead(event, for: id)
-            }
+            // Append, save, then drain: the event is on disk before vendor
+            // code runs, and it can never overtake anything queued before it
+            // (a send in flight, or a failed head waiting out its backoff).
+            let seq = state.buffer.nextSeq
+            let evictedBefore = state.buffer.evicted
+            let delivery = buffer(event, for: id)
+            guard delivery == .buffered || delivery == .bufferedVolatile else { return delivery }
+            try await drainIfDue(id)
+            let stillQueued = state.buffer.pending(for: id).contains { $0.seq == seq }
+            return (stillQueued || state.buffer.evicted != evictedBefore) ? delivery : .sent
         case .skipped(let reason)? where !reason.buffersEvents:
             dropped[id] = Saturating.increment(dropped[id] ?? 0)
             return .dropped(.policy)
@@ -439,21 +430,38 @@ public actor ContainmentRuntime {
         }
     }
 
-    private func buffer(_ event: ContainedEvent, for id: VendorID) -> Delivery {
-        switch state.buffer.append(event, for: id) {
-        case .buffered, .bufferedEvictingOldest:
-            return persist() ? .buffered : .bufferedVolatile
-        case .refusedPersonal:
+    /// `.personal` events never touch disk. They go out live only when that
+    /// can't overtake anything; otherwise they are dropped and counted.
+    private func sendPersonalLive(_ event: ContainedEvent, to id: VendorID) async throws -> Delivery {
+        guard state.buffer.count(for: id) == 0, !inFlight.contains(id), let adapter = adapters[id] else {
             dropped[id] = Saturating.increment(dropped[id] ?? 0)
             return .dropped(.personalNotBufferable)
-        case .refusedNoCapacity:
-            dropped[id] = Saturating.increment(dropped[id] ?? 0)
-            return .dropped(.noCapacity)
         }
+        inFlight.insert(id)
+        let delivery: Delivery
+        do {
+            try await adapter.send(event)
+            inFlight.remove(id)
+            try ensureAlive()
+            sent[id] = Saturating.increment(sent[id] ?? 0)
+            delivery = .sent
+        } catch let fault as FatalFault {
+            terminated = true
+            throw fault
+        } catch {
+            inFlight.remove(id)
+            try ensureAlive()
+            dropped[id] = Saturating.increment(dropped[id] ?? 0)
+            delivery = .dropped(.personalNotBufferable)
+        }
+        // Anything a reentrant `track` queued while this send was in flight
+        // is delivered now, not stranded until the next event.
+        try await drainIfDue(id)
+        return delivery
     }
 
-    private func requeueAtHead(_ event: ContainedEvent, for id: VendorID) -> Delivery {
-        switch state.buffer.prepend(event, for: id) {
+    private func buffer(_ event: ContainedEvent, for id: VendorID) -> Delivery {
+        switch state.buffer.append(event, for: id) {
         case .buffered, .bufferedEvictingOldest:
             return persist() ? .buffered : .bufferedVolatile
         case .refusedPersonal:
@@ -482,13 +490,13 @@ public actor ContainmentRuntime {
 
     /// Replays a running vendor's queue in order, at-least-once.
     ///
-    /// Reentrancy: while a send is suspended the vendor is `inFlight`, so new
-    /// `track` calls append behind the queue rather than overtaking it, and
-    /// the loop picks them up. The head stays on disk until its send
+    /// Reentrancy: while a send is suspended the vendor is `inFlight`, so a
+    /// reentrant `track` appends behind the queue and returns, and this loop
+    /// picks the event up. The head stays on disk until its send
     /// succeeds, so a crash mid-send replays it next launch instead of losing
     /// it. A failed send leaves the head in place, starts an exponential
-    /// backoff, and stops; the next `track` (or ``flush()``) after the
-    /// backoff resumes the drain.
+    /// backoff (no timer), and stops; the next `track` after the backoff, or
+    /// ``flush()`` at any time, resumes the drain.
     private func drain(_ id: VendorID) async throws {
         guard let adapter = adapters[id], !inFlight.contains(id) else { return }
         inFlight.insert(id)

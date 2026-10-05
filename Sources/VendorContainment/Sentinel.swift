@@ -158,7 +158,7 @@ public enum LaunchSentinel {
             let isProvisional = provisional.contains(vendor)
             h.strikes = Saturating.increment(h.strikes)
             if isProvisional {
-                h.strikes = min(h.strikes, max(0, configuration.strikeThreshold - 1))
+                h.strikes = min(h.strikes, max(0, Saturating.add(configuration.strikeThreshold, -1)))
                 h.suspect = true
                 findings.append(.crashProbablyAttributed(vendor, strikes: h.strikes, alsoRunning: onProbation))
             } else {
@@ -178,7 +178,7 @@ public enum LaunchSentinel {
                 h.quarantine = q
                 h.probing = false
                 findings.append(.requarantined(vendor, cooldown: q.cooldown))
-            } else if h.quarantine == nil, h.strikes >= configuration.strikeThreshold {
+            } else if !isProvisional, h.quarantine == nil, h.strikes >= max(1, configuration.strikeThreshold) {
                 let cooldown = min(configuration.baseCooldown, configuration.maxCooldown)
                 h.quarantine = Quarantine(
                     since: now, cooldown: cooldown, trips: 1,

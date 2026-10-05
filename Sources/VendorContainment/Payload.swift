@@ -64,8 +64,10 @@ public enum PayloadViolation: Sendable, Equatable, CustomStringConvertible {
 }
 
 public enum PayloadValidator {
-    /// Validates `payload` against `schema`. Returns every violation found
-    /// (sorted, deterministic), or an empty array if the payload is safe.
+    /// Validates `payload` against `schema`. Returns the required-key
+    /// violations (sorted by key) followed by the first structural violation
+    /// found, or an empty array if the payload is safe. Object members are
+    /// walked in key order, so the result is deterministic.
     ///
     /// The walk is iterative with an explicit stack and checks width before
     /// allocating, so validation itself never recurses and stops as soon as
@@ -97,7 +99,8 @@ public enum PayloadValidator {
             violations.append(.tooManyNodes(limit: schema.maxNodes))
             return violations
         }
-        var stack: [(PayloadValue, Int)] = payload.values.map { ($0, 1) }
+        // Reversed so that popLast() visits keys in ascending order.
+        var stack: [(PayloadValue, Int)] = payload.sorted { $0.key < $1.key }.reversed().map { ($0.value, 1) }
         var nodes = 0
         while let (value, depth) = stack.popLast() {
             nodes = Saturating.increment(nodes)
@@ -120,7 +123,7 @@ public enum PayloadValidator {
                     return violations
                 }
                 let next = Saturating.increment(depth)
-                stack.append(contentsOf: items.map { ($0, next) })
+                stack.append(contentsOf: items.reversed().map { ($0, next) })
             case .object(let dict):
                 guard Saturating.add(Saturating.add(nodes, stack.count), dict.count) <= schema.maxNodes else {
                     violations.append(.tooManyNodes(limit: schema.maxNodes))
@@ -131,7 +134,7 @@ public enum PayloadValidator {
                     return violations
                 }
                 let next = Saturating.increment(depth)
-                stack.append(contentsOf: dict.values.map { ($0, next) })
+                stack.append(contentsOf: dict.sorted { $0.key < $1.key }.reversed().map { ($0.value, next) })
             default:
                 break
             }

@@ -20,8 +20,9 @@ public enum Saturating {
         return overflow ? UInt64.max : result
     }
 
-    /// Doubles a cooldown, capped at `cap`. Non-finite or negative input
-    /// collapses to `cap` / `0` respectively so callers never see NaN.
+    /// Doubles a cooldown, capped at `cap`. Never returns NaN or infinity:
+    /// a non-finite or non-positive `cap` gives 0; NaN or ±infinite `seconds`
+    /// gives `cap`; zero or negative finite `seconds` gives 0.
     public static func doubled(_ seconds: TimeInterval, cap: TimeInterval) -> TimeInterval {
         guard cap.isFinite, cap > 0 else { return 0 }
         guard seconds.isFinite else { return cap }

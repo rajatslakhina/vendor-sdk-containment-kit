@@ -30,10 +30,11 @@ public struct VendorID: Hashable, Codable, Sendable, Comparable, CodingKeyRepres
 
 /// When a vendor is allowed to start.
 ///
-/// There is deliberately **no pre-first-frame case**. The Firebase outage of
-/// 28 Sep 2026 crashed apps inside `didFinishLaunching`, before any UI existed
-/// and before any app-owned recovery code could run. Making "start a vendor
-/// during launch" unrepresentable is cheaper than reviewing for it.
+/// There is deliberately **no pre-first-frame case**. A vendor that crashes
+/// during launch does so before any UI exists and before any app-owned
+/// recovery code can run (the 28 Sep 2026 Firebase incident crashed apps at
+/// launch). Making "start a vendor during launch" unrepresentable is cheaper
+/// than reviewing for it.
 public enum StartupStage: Int, Codable, Sendable, CaseIterable, Comparable {
     /// Immediately after the first frame is on screen.
     case afterFirstFrame = 1

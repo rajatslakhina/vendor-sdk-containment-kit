@@ -63,30 +63,6 @@ public struct EventBuffer: Codable, Sendable, Equatable {
         return outcome
     }
 
-    /// Puts an event at the head (a failed live send: everything already
-    /// queued arrived later). If the queue is full the event itself, being
-    /// the oldest, is the one evicted.
-    @discardableResult
-    public mutating func prepend(_ event: ContainedEvent, for vendor: VendorID) -> BufferOutcome {
-        guard event.privacy != .personal else {
-            refused = Saturating.increment(refused)
-            return .refusedPersonal
-        }
-        guard capacityPerVendor > 0 else {
-            refused = Saturating.increment(refused)
-            return .refusedNoCapacity
-        }
-        var queue = queues[vendor] ?? []
-        guard queue.count < capacityPerVendor else {
-            evicted = Saturating.increment(evicted)
-            return .refusedNoCapacity
-        }
-        queue.insert(BufferedEvent(seq: nextSeq, vendor: vendor, event: event), at: 0)
-        nextSeq = Saturating.increment(nextSeq)
-        queues[vendor] = queue
-        return .buffered
-    }
-
     /// A copy with a new per-vendor capacity, preserving global order and
     /// the lifetime counters.
     public func resized(to capacity: Int) -> EventBuffer {

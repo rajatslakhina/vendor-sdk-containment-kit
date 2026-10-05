@@ -61,9 +61,15 @@ public final class SimulationLedger: @unchecked Sendable {
         return _startedAt[vendor]
     }
 
+    /// Keeps the most recent `maxReceived` names per vendor (bounded memory).
+    static let maxReceived = 1_000
+
     func recordReceived(_ name: String, by vendor: VendorID) {
         lock.lock(); defer { lock.unlock() }
-        _received[vendor, default: []].append(name)
+        var list = _received[vendor, default: []]
+        list.append(name)
+        if list.count > Self.maxReceived { list.removeFirst(list.count - Self.maxReceived) }
+        _received[vendor] = list
     }
 
     /// Vendors started in the current launch, in start order.
@@ -159,8 +165,17 @@ public struct LaunchRecord: Sendable, Equatable, Identifiable {
     public let snapshot: RuntimeSnapshot
 }
 
+public enum LaunchSimulatorError: Error, Equatable {
+    /// `launch()` was called while another launch was still running. Two
+    /// overlapping launches would be two processes sharing one store.
+    case launchInProgress
+}
+
 /// Drives repeated launches against one persistent store.
 public actor LaunchSimulator {
+    /// `history` keeps the most recent launches only.
+    public static let maxHistory = 50
+
     public nonisolated let ledger = SimulationLedger()
     public let clock: ManualClock
     public let store: any ContainmentStore
@@ -177,6 +192,14 @@ public actor LaunchSimulator {
     public var relaunchGap: TimeInterval = 30
     public private(set) var current: ContainmentRuntime?
     public private(set) var history: [LaunchRecord] = []
+    private var launching = false
+    private var beforeStartup: (@Sendable () async -> Void)?
+
+    /// Whether a launch is currently in progress.
+    public var isLaunching: Bool { launching }
+
+    /// Test seam: runs inside `launch()` after boot, before startup.
+    public func setBeforeStartupHook(_ hook: (@Sendable () async -> Void)?) { beforeStartup = hook }
 
     public init(
         vendors: [(id: VendorID, stage: StartupStage)],
@@ -214,6 +237,10 @@ public actor LaunchSimulator {
     public func launch(
         configuration override: ContainmentConfiguration? = nil
     ) async throws -> LaunchRecord {
+        // Set before the first suspension point, so a reentrant call sees it.
+        guard !launching else { throw LaunchSimulatorError.launchInProgress }
+        launching = true
+        defer { launching = false }
         clock.advance(by: relaunchGap)
         ledger.beginLaunch()
         let adapters: [any VendorAdapter] = vendors.map {
@@ -235,6 +262,7 @@ public actor LaunchSimulator {
         current = runtime
         try await runtime.boot(policy: remotePolicy, payloads: payloads)
         try await runtime.track("app_open")
+        if let beforeStartup { await beforeStartup() }
 
         var culprit: VendorID?
         do {
@@ -246,6 +274,7 @@ public actor LaunchSimulator {
         let snap = await runtime.snapshot()
         let record = LaunchRecord(number: snap.launchCount, crashedBy: culprit, snapshot: snap)
         history.append(record)
+        if history.count > Self.maxHistory { history.removeFirst(history.count - Self.maxHistory) }
         return record
     }
 
