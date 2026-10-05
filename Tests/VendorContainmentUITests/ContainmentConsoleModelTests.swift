@@ -29,6 +29,14 @@ final class ContainmentConsoleModelTests: XCTestCase {
         // Newest first.
         XCTAssertEqual(model.launches.map(\.crashedBy), [nil, nil, "attribution", "attribution"])
         XCTAssertEqual(model.launches.first?.headline, "Up: attribution contained")
+        // The demo README's table, row by row: launch 2's findings show the
+        // provisional attribution of launch 1 and analytics clearing its
+        // window alone before attribution died alone.
+        let launch2 = model.launches[2].details
+        XCTAssertTrue(launch2.contains { $0.contains("crashed in attribution.start() with analytics on probation (provisional strike 1") }, "\(launch2)")
+        XCTAssertTrue(launch2.contains("analytics survived the stability window"), "\(launch2)")
+        let launch3 = model.launches[1].details
+        XCTAssertTrue(launch3.contains("previous launch crashed while attribution was in flight (strike 2)"), "\(launch3)")
         let row = model.vendorRows.first { $0.id == "attribution" }
         XCTAssertEqual(row?.quarantined, true)
         XCTAssertEqual(row?.isHealthy, false)
@@ -40,6 +48,7 @@ final class ContainmentConsoleModelTests: XCTestCase {
         await model.launch()
         XCTAssertNil(model.launches.first?.crashedBy)
         XCTAssertTrue(model.vendorRows.first { $0.id == "attribution" }?.state.hasPrefix("payload rejected") ?? false)
+        XCTAssertEqual(model.launches.first?.headline, "Up: attribution not started (payload rejected)")
     }
 
     func testReleaseBringsTheVendorBackAndTrackReportsDeliveries() async {
@@ -76,11 +85,16 @@ final class ContainmentConsoleModelTests: XCTestCase {
         XCTAssertEqual(model.launches.first?.crashedBy, "attribution")
         await model.launch()
         XCTAssertNil(model.launches.first?.crashedBy)
-        XCTAssertTrue(model.launches.first?.details.contains { $0.contains("failed its probe") } ?? false)
+        XCTAssertTrue(
+            model.launches.first?.details.contains("attribution failed its probe; quarantined for 7200s") ?? false,
+            "the cooldown doubles from 3600s"
+        )
     }
 
     func testTrackWithNoLiveLaunchSaysSo() async {
         let model = makeModel()
+        await model.trackEvent()
+        XCTAssertEqual(model.lastMessage, "No launch yet. Tap Launch app.")
         await model.launch() // crashes
         await model.trackEvent()
         XCTAssertEqual(model.lastMessage, "No live launch: the last one crashed. Launch again.")
