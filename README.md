@@ -133,7 +133,7 @@ Tests/                          89 XCTest cases across both modules
 
 - **Local (Linux, Swift 6.1.2):** clean build (`rm -rf .build`) with `swift build --build-tests -Xswiftc -warnings-as-errors` gives 0 warnings. The XCTest bundle passes **89 / 89**.
 - **CI:** see the [Actions tab](https://github.com/rajatslakhina/vendor-sdk-containment-kit/actions). The Linux job runs `swift build -Xswiftc -warnings-as-errors` + `swift test -Xlinker --allow-shlib-undefined` in `swift:6.1-noble` (the linker flag works around a missing Observation symbol in the Linux toolchain). The macOS job runs `swift test -Xswiftc -warnings-as-errors` and compiles the SwiftUI view for `generic/platform=iOS Simulator`.
-- **Simulator:** the demo app has **not** been run on a Simulator. The unattended session that built it couldn't drive Xcode, and no screenshots exist. The demo repo's CI is configured to compile it for `generic/platform=iOS Simulator` against this package from GitHub. That would be a build, not a run. The console model behind it is unit-tested (`VendorContainmentUITests`).
+- **Simulator:** the demo app has **not** been run on a Simulator. The unattended session that built it couldn't drive Xcode, and no screenshots exist. The demo repo's CI resolves this package from GitHub (`v1.0.1`) and compiles the app for `generic/platform=iOS Simulator`. It passed, but that's a build, not a run. The console model behind it is unit-tested (`VendorContainmentUITests`).
 
 ## License
 
